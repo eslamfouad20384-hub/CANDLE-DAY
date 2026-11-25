@@ -1,13 +1,16 @@
 
-# app.py
 import streamlit as st
 import pandas as pd
 import requests
-import json
 import time
 import io
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone
+
+# ==========================================
+# EGX DAILY CANDLE DOWNLOADER
+# DataCedar API V3
+# ==========================================
 
 st.set_page_config(
     page_title="EGX Daily Candle Downloader",
@@ -15,102 +18,304 @@ st.set_page_config(
     layout="wide"
 )
 
+API_BASE = "https://api.datacedar.com/v3"
+EXCHANGE = "egx"
+
 st.title("📈 EGX Daily Candle Downloader")
-st.caption("تحميل الشموع اليومية لأسهم البورصة المصرية من DataCedar")
+st.caption("تحميل الشموع اليومية لأسهم البورصة المصرية")
 
-API_BASE = "https://api.datacedar.com"
+# ==========================================
+# SECRET
+# ==========================================
 
-def headers(api_key):
-    return {
-        "Authorization": f"Bearer {api_key}",
-        "X-API-Key": api_key,
-        "Accept": "application/json",
-        "Content-Type": "application/json"
-    }
+try:
+    API_KEY = st.secrets["DATACEDAR_API_KEY"]
+except Exception:
+    API_KEY = ""
 
-def get_json(url, api_key, params=None):
+if not API_KEY:
+    st.error(
+        "مفتاح DataCedar غير موجود. "
+        "أضفه في Streamlit Settings → Secrets."
+    )
+    st.stop()
+
+HEADERS = {
+    "Authorization": f"Bearer {API_KEY}",
+    "X-API-Key": API_KEY,
+    "Accept": "application/json"
+}
+
+# ==========================================
+# HTTP
+# ==========================================
+
+def api_get(url, params=None):
     response = requests.get(
         url,
-        headers=headers(api_key),
+        headers=HEADERS,
         params=params,
-        timeout=30
+        timeout=60
     )
-    response.raise_for_status()
+
+    if response.status_code != 200:
+        try:
+            detail = response.json()
+        except Exception:
+            detail = response.text[:1000]
+
+        raise Exception(
+            f"HTTP {response.status_code}: {detail}"
+        )
+
     return response.json()
 
-def extract_rows(data):
+
+def extract_data(result):
+    data = result.get("data", [])
+
     if isinstance(data, list):
         return data
 
     if isinstance(data, dict):
-        for key in ("data", "results", "bars", "items"):
-            value = data.get(key)
-            if isinstance(value, list):
-                return value
+        return data
 
     return []
 
-def load_symbols(uploaded):
-    if uploaded:
-        content = uploaded.getvalue().decode("utf-8-sig")
-        return list(dict.fromkeys(
-            x.strip().upper()
-            for x in content.replace(",", "\n").splitlines()
-            if x.strip()
-        ))
 
-    try:
-        with open("symbols.txt", encoding="utf-8") as f:
-            return list(dict.fromkeys(
-                x.strip().upper()
-                for x in f.read().replace(",", "\n").splitlines()
-                if x.strip()
-            ))
-    except FileNotFoundError:
-        return []
+# ==========================================
+# SYMBOLS
+# ==========================================
 
-def find_symbol(row):
-    return str(
-        row.get("symbol")
-        or row.get("ticker")
-        or row.get("code")
+def normalize_symbol(value):
+    value = str(value or "").strip().upper()
+
+    if value.endswith(".CA"):
+        value = value[:-3]
+
+    return value
+
+
+def load_symbols(uploaded_file, pasted_text):
+    raw = ""
+
+    if uploaded_file:
+        raw = uploaded_file.getvalue().decode(
+            "utf-8-sig", errors="ignore"
+        )
+    elif pasted_text.strip():
+        raw = pasted_text
+    else:
+        try:
+            with open("symbols.txt", encoding="utf-8-sig") as f:
+                raw = f.read()
+        except FileNotFoundError:
+            raw = ""
+
+    symbols = []
+
+    for line in raw.replace(",", "\n").splitlines():
+        item = normalize_symbol(line)
+
+        if item and item not in symbols:
+            symbols.append(item)
+
+    return symbols
+
+
+# ==========================================
+# ASSET REGISTRY
+# ==========================================
+
+def load_registry():
+    url = f"{API_BASE}/stocks/assets"
+
+    assets = []
+    cursor = None
+
+    while True:
+        params = {
+            "exchange": EXCHANGE,
+            "limit": 1000
+        }
+
+        if cursor:
+            params["cursor"] = cursor
+
+        result = api_get(url, params)
+        data = extract_data(result)
+
+        if isinstance(data, list):
+            assets.extend(data)
+
+        pagination = result.get("pagination", {})
+        cursor = pagination.get("next_cursor")
+
+        if not cursor:
+            break
+
+    return assets
+
+
+def asset_symbol(asset):
+    return normalize_symbol(
+        asset.get("symbol")
+        or asset.get("ticker")
         or ""
-    ).upper().strip()
+    )
 
-def download_registry(api_key):
-    # المسار ده لازم يتوافق مع مسار سجل الأصول في حساب DataCedar.
-    url = f"{API_BASE}/v3/stocks"
-    data = get_json(url, api_key)
-    return extract_rows(data), data
 
-def get_bars(api_key, asset):
+def asset_sid(asset):
+    return str(
+        asset.get("sid")
+        or ""
+    ).strip()
+
+
+def resolve_from_registry(symbol, registry):
+    target = normalize_symbol(symbol)
+
+    for asset in registry:
+        candidates = [
+            asset.get("symbol"),
+            asset.get("ticker"),
+            asset.get("sid")
+        ]
+
+        for candidate in candidates:
+            candidate = normalize_symbol(candidate)
+
+            if candidate == target:
+                return asset
+
+    return None
+
+
+# ==========================================
+# SEARCH SYMBOL
+# ==========================================
+
+def search_symbol(symbol):
+    url = f"{API_BASE}/search"
+
+    result = api_get(
+        url,
+        params={
+            "q": symbol,
+            "exchange": EXCHANGE,
+            "limit": 10
+        }
+    )
+
+    data = extract_data(result)
+
+    if not isinstance(data, list):
+        return None
+
+    target = normalize_symbol(symbol)
+
+    for asset in data:
+        candidates = [
+            asset.get("symbol"),
+            asset.get("ticker")
+        ]
+
+        for candidate in candidates:
+            if normalize_symbol(candidate) == target:
+                return asset
+
+    # لا نختار نتيجة تقريبية بشكل تلقائي
+    return None
+
+
+# ==========================================
+# DAILY BARS
+# ==========================================
+
+def get_bars_url(asset):
     bars_url = asset.get("bars_url")
 
-    if not bars_url:
-        return None, "لا يوجد bars_url في سجل السهم"
+    if bars_url:
+        if bars_url.startswith("http"):
+            return bars_url
 
-    if bars_url.startswith("http"):
-        url = bars_url
+        return (
+            "https://api.datacedar.com/"
+            + bars_url.lstrip("/")
+        )
+
+    sid = asset_sid(asset)
+
+    if sid:
+        return f"{API_BASE}/stocks/{sid}/bars"
+
+    raise Exception("السهم لا يحتوي على bars_url أو sid")
+
+
+def download_bars(asset, requested_symbol):
+    url = get_bars_url(asset)
+
+    all_rows = []
+    cursor = None
+
+    while True:
+        params = {
+            "timeframe": "1d",
+            "order": "asc",
+            "limit": 50000,
+            "adjustment": "raw"
+        }
+
+        if cursor:
+            params["cursor"] = cursor
+
+        result = api_get(url, params)
+        data = extract_data(result)
+
+        if isinstance(data, list):
+            all_rows.extend(data)
+
+        pagination = result.get("pagination", {})
+        cursor = pagination.get("next_cursor")
+
+        if not cursor:
+            break
+
+    if not all_rows:
+        raise Exception("لا توجد شموع متاحة لهذا السهم")
+
+    df = pd.DataFrame(all_rows)
+
+    if "ts_ms" in df.columns:
+        timestamps = pd.to_numeric(
+            df["ts_ms"], errors="coerce"
+        )
+
+        df["date"] = pd.to_datetime(
+            timestamps,
+            unit="ms",
+            utc=True,
+            errors="coerce"
+        ).dt.tz_convert("Africa/Cairo").dt.strftime("%Y-%m-%d")
+
+    elif "date" in df.columns:
+        df["date"] = pd.to_datetime(
+            df["date"], errors="coerce"
+        ).dt.strftime("%Y-%m-%d")
+
+    elif "timestamp" in df.columns:
+        df["date"] = pd.to_datetime(
+            df["timestamp"],
+            utc=True,
+            errors="coerce"
+        ).dt.tz_convert("Africa/Cairo").dt.strftime("%Y-%m-%d")
+
     else:
-        url = API_BASE.rstrip("/") + "/" + bars_url.lstrip("/")
+        raise Exception(
+            "حقل التاريخ غير موجود في استجابة DataCedar"
+        )
 
-    params = {
-        "timeframe": "1Day",
-        "limit": 1000
-    }
-
-    data = get_json(url, api_key, params=params)
-    rows = extract_rows(data)
-
-    if not rows:
-        return None, "الـ API رجع بدون شموع"
-
-    df = pd.DataFrame(rows)
-
-    # توحيد أسماء الأعمدة الشائعة
     aliases = {
-        "timestamp": "date",
-        "t": "date",
         "o": "open",
         "h": "high",
         "l": "low",
@@ -118,215 +323,324 @@ def get_bars(api_key, asset):
         "v": "volume"
     }
 
-    df.rename(columns={
-        col: aliases[col]
-        for col in df.columns
-        if col in aliases
-    }, inplace=True)
+    df.rename(
+        columns={
+            old: new
+            for old, new in aliases.items()
+            if old in df.columns and new not in df.columns
+        },
+        inplace=True
+    )
 
-    required = ["date", "open", "high", "low", "close"]
+    required = [
+        "date", "open", "high", "low", "close"
+    ]
 
-    if not all(col in df.columns for col in required):
-        return None, "حقول الشمعة غير مكتملة: " + ", ".join(df.columns)
+    missing = [
+        col for col in required
+        if col not in df.columns
+    ]
+
+    if missing:
+        raise Exception(
+            "حقول ناقصة: " + ", ".join(missing)
+        )
 
     if "volume" not in df.columns:
         df["volume"] = 0
 
-    df["symbol"] = find_symbol(asset)
+    for col in [
+        "open", "high", "low", "close", "volume"
+    ]:
+        df[col] = pd.to_numeric(
+            df[col], errors="coerce"
+        )
 
-    df["date"] = pd.to_datetime(
-        df["date"], errors="coerce", utc=True
-    ).dt.strftime("%Y-%m-%d")
+    df["symbol"] = normalize_symbol(requested_symbol)
+    df["sid"] = asset_sid(asset)
 
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df.dropna(subset=["date", "open", "high", "low", "close"], inplace=True)
-    df = df[[
-        "symbol", "date", "open", "high",
-        "low", "close", "volume"
-    ]]
-
-    df.drop_duplicates(subset=["symbol", "date"], inplace=True)
-    df.sort_values("date", inplace=True)
-
-    return df, None
-
-
-with st.sidebar:
-    st.header("إعدادات الاتصال")
-    api_key = st.text_input(
-        "DataCedar API Key",
-        type="password"
+    df.dropna(
+        subset=["date", "open", "high", "low", "close"],
+        inplace=True
     )
 
-    uploaded_symbols = st.file_uploader(
-        "تحميل قائمة الأسهم TXT أو CSV",
-        type=["txt", "csv"]
+    df.drop_duplicates(
+        subset=["symbol", "date"],
+        inplace=True
     )
 
-    limit = st.number_input(
-        "عدد الأسهم المراد تحميلها",
-        min_value=1,
-        max_value=300,
-        value=201
+    df.sort_values(
+        ["symbol", "date"],
+        inplace=True
     )
 
-    delay = st.number_input(
-        "فاصل زمني بين الطلبات بالثواني",
-        min_value=0.0,
-        max_value=5.0,
-        value=0.2
-    )
+    columns = [
+        "symbol", "sid", "date",
+        "open", "high", "low", "close", "volume"
+    ]
 
-symbols = load_symbols(uploaded_symbols)
+    return df[columns]
 
-st.write(f"عدد الرموز الموجودة: **{len(symbols)}**")
 
-if st.button("1 - جلب سجل الأسهم من DataCedar", disabled=not api_key):
+# ==========================================
+# INTERFACE
+# ==========================================
+
+st.sidebar.header("إعدادات التحميل")
+
+uploaded_file = st.sidebar.file_uploader(
+    "تحميل قائمة الأسهم",
+    type=["txt", "csv"]
+)
+
+pasted_symbols = st.sidebar.text_area(
+    "أو الصق رموز الأسهم هنا",
+    height=180,
+    placeholder="COMI\nMFPC\nPHDC\nORAS"
+)
+
+symbols = load_symbols(
+    uploaded_file,
+    pasted_symbols
+)
+
+st.sidebar.metric(
+    "عدد الأسهم المطلوبة",
+    len(symbols)
+)
+
+delay = st.sidebar.number_input(
+    "الفاصل بين طلبات البحث بالثواني",
+    min_value=0.0,
+    max_value=5.0,
+    value=1.1,
+    step=0.1
+)
+
+st.info(
+    "المفتاح يتم قراءته تلقائيًا من Streamlit Secrets. "
+    "مش محتاج تدخله في الواجهة."
+)
+
+# ==========================================
+# LOAD REGISTRY
+# ==========================================
+
+if st.button("1️⃣ جلب سجل أصول EGX", type="primary"):
+
     try:
         with st.spinner("جاري جلب سجل الأصول..."):
-            registry, raw_registry = download_registry(api_key)
+            registry = load_registry()
 
         st.session_state["registry"] = registry
-        st.session_state["raw_registry"] = raw_registry
 
-        st.success(f"تم جلب {len(registry)} سجل")
-        st.dataframe(pd.DataFrame(registry), use_container_width=True)
+        st.success(
+            f"تم تحميل سجل الأصول: {len(registry)} سجل"
+        )
+
+        registry_df = pd.DataFrame(registry)
+
+        st.dataframe(
+            registry_df,
+            use_container_width=True
+        )
 
     except Exception as e:
         st.error(f"فشل جلب سجل الأصول: {e}")
 
+
+# ==========================================
+# DOWNLOAD
+# ==========================================
+
 if "registry" in st.session_state:
+
     registry = st.session_state["registry"]
 
-    st.subheader("مطابقة الأسهم")
-    registry_df = pd.DataFrame(registry)
+    st.subheader("2️⃣ تحميل الشموع اليومية")
 
-    if not registry_df.empty:
-        registry_df["match_symbol"] = registry_df.apply(find_symbol, axis=1)
-        matched = registry_df[
-            registry_df["match_symbol"].isin(symbols)
-        ]
+    if not symbols:
+        st.warning(
+            "ارفع symbols.txt أو الصق رموز الأسهم في الشريط الجانبي."
+        )
 
-        st.write(f"الأسهم المطابقة: **{len(matched)}**")
+    if st.button(
+        "ابدأ تحميل الشموع",
+        disabled=not symbols
+    ):
 
-        if st.button("2 - ابدأ تحميل الشموع اليومية"):
-            results = []
-            reports = []
+        downloaded = []
+        report = []
 
-            progress = st.progress(0)
-            status = st.empty()
+        progress = st.progress(0)
+        status = st.empty()
 
-            assets = matched.head(int(limit)).to_dict("records")
-            total = len(assets)
+        total = len(symbols)
 
-            for i, asset in enumerate(assets, 1):
-                symbol = find_symbol(asset)
-                status.write(f"تحميل {symbol} — {i}/{total}")
+        for index, symbol in enumerate(symbols, 1):
 
-                try:
-                    df, error = get_bars(api_key, asset)
-
-                    if error:
-                        reports.append({
-                            "symbol": symbol,
-                            "status": "فشل",
-                            "details": error
-                        })
-                    else:
-                        results.append(df)
-                        reports.append({
-                            "symbol": symbol,
-                            "status": "نجاح",
-                            "candles": len(df),
-                            "details": "تم التحميل"
-                        })
-
-                except Exception as e:
-                    reports.append({
-                        "symbol": symbol,
-                        "status": "فشل",
-                        "details": str(e)[:300]
-                    })
-
-                progress.progress(i / max(total, 1))
-                time.sleep(float(delay))
-
-            all_data = (
-                pd.concat(results, ignore_index=True)
-                if results else pd.DataFrame()
+            status.write(
+                f"جاري معالجة {symbol} — {index}/{total}"
             )
 
-            report_df = pd.DataFrame(reports)
+            try:
+                asset = resolve_from_registry(
+                    symbol, registry
+                )
 
-            st.session_state["candles"] = all_data
-            st.session_state["report"] = report_df
+                if asset is None:
+                    asset = search_symbol(symbol)
+                    time.sleep(float(delay))
 
-            st.success(
-                f"اكتمل التحميل: {len(results)} سهم نجح "
-                f"من أصل {total}"
+                if asset is None:
+                    raise Exception(
+                        "لم يتم العثور على تطابق مؤكد للرمز"
+                    )
+
+                df = download_bars(asset, symbol)
+
+                downloaded.append(df)
+
+                report.append({
+                    "symbol": symbol,
+                    "sid": asset_sid(asset),
+                    "status": "نجاح",
+                    "candles": len(df),
+                    "first_date": df["date"].min(),
+                    "last_date": df["date"].max(),
+                    "details": "تم التحميل"
+                })
+
+            except Exception as e:
+                report.append({
+                    "symbol": symbol,
+                    "sid": "",
+                    "status": "فشل",
+                    "candles": 0,
+                    "first_date": "",
+                    "last_date": "",
+                    "details": str(e)[:500]
+                })
+
+            progress.progress(index / total)
+
+        if downloaded:
+            all_candles = pd.concat(
+                downloaded,
+                ignore_index=True
+            )
+        else:
+            all_candles = pd.DataFrame(
+                columns=[
+                    "symbol", "sid", "date",
+                    "open", "high", "low",
+                    "close", "volume"
+                ]
             )
 
-if "candles" in st.session_state:
+        report_df = pd.DataFrame(report)
+
+        st.session_state["candles"] = all_candles
+        st.session_state["report"] = report_df
+
+        status.success("اكتمل التحميل")
+
+
+# ==========================================
+# RESULTS
+# ==========================================
+
+if "report" in st.session_state:
+
     candles = st.session_state["candles"]
     report = st.session_state["report"]
 
-    st.subheader("نتيجة التحميل")
+    st.divider()
+    st.subheader("📊 نتائج التحميل")
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("عدد الأسهم الناجحة", int(
+    success_count = int(
         (report["status"] == "نجاح").sum()
-    ))
-    c2.metric("عدد الشموع", len(candles))
-    c3.metric("عدد الأسهم الفاشلة", int(
-        (report["status"] == "فشل").sum()
-    ))
+    )
 
-    st.dataframe(report, use_container_width=True)
+    failed_count = int(
+        (report["status"] == "فشل").sum()
+    )
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric("الأسهم الناجحة", success_count)
+    col2.metric("الأسهم الفاشلة", failed_count)
+    col3.metric("إجمالي الشموع", len(candles))
+
+    st.dataframe(
+        report,
+        use_container_width=True
+    )
+
+    st.subheader("معاينة الشموع")
+
+    st.dataframe(
+        candles.tail(100),
+        use_container_width=True
+    )
+
+    # CSV
+    csv_data = candles.to_csv(
+        index=False
+    ).encode("utf-8-sig")
 
     st.download_button(
-        "تحميل كل الشموع CSV",
-        candles.to_csv(index=False).encode("utf-8-sig"),
+        "⬇️ تحميل الشموع CSV",
+        data=csv_data,
         file_name="EGX_DAILY_CANDLES.csv",
         mime="text/csv"
     )
 
+    # REPORT
+    report_csv = report.to_csv(
+        index=False
+    ).encode("utf-8-sig")
+
     st.download_button(
-        "تحميل تقرير الأسهم CSV",
-        report.to_csv(index=False).encode("utf-8-sig"),
+        "⬇️ تحميل تقرير الأسهم",
+        data=report_csv,
         file_name="EGX_DOWNLOAD_REPORT.csv",
         mime="text/csv"
     )
 
-    if st.button("تجهيز ZIP بكل الملفات"):
-        buffer = io.BytesIO()
+    # ZIP
+    buffer = io.BytesIO()
 
-        with zipfile.ZipFile(
-            buffer, "w", zipfile.ZIP_DEFLATED
-        ) as z:
-            z.writestr(
-                "EGX_DAILY_CANDLES.csv",
-                candles.to_csv(index=False)
-            )
-            z.writestr(
-                "EGX_DOWNLOAD_REPORT.csv",
-                report.to_csv(index=False)
-            )
+    with zipfile.ZipFile(
+        buffer,
+        "w",
+        zipfile.ZIP_DEFLATED
+    ) as z:
 
-            if "raw_registry" in st.session_state:
-                z.writestr(
-                    "DATACEDAR_REGISTRY.json",
-                    json.dumps(
-                        st.session_state["raw_registry"],
-                        ensure_ascii=False,
-                        indent=2
-                    )
-                )
-
-        st.download_button(
-            "⬇️ تنزيل ملف ZIP",
-            buffer.getvalue(),
-            file_name="EGX_DAILY_DATA_PACKAGE.zip",
-            mime="application/zip"
+        z.writestr(
+            "EGX_DAILY_CANDLES.csv",
+            csv_data
         )
+
+        z.writestr(
+            "EGX_DOWNLOAD_REPORT.csv",
+            report_csv
+        )
+
+        z.writestr(
+            "DOWNLOAD_INFO.txt",
+            (
+                "EGX Daily Candle Downloader\n"
+                f"Generated: {datetime.now().isoformat()}\n"
+                f"Successful symbols: {success_count}\n"
+                f"Failed symbols: {failed_count}\n"
+                f"Total candles: {len(candles)}\n"
+            )
+        )
+
+    st.download_button(
+        "📦 تحميل كل البيانات ZIP",
+        data=buffer.getvalue(),
+        file_name="EGX_DAILY_DATA_PACKAGE.zip",
+        mime="application/zip"
+    )
