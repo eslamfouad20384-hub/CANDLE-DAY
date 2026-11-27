@@ -1,23 +1,29 @@
+
 import io
-import json
 import time
 import zipfile
 from datetime import date, timedelta
-from typing import Any
 
 import pandas as pd
-import requests
 import streamlit as st
+import yfinance as yf
 
-APIFY_ACTOR = "mansalabs~egx-stock-data"
-APIFY_BASE = "https://api.apify.com/v2"
-APP_VERSION = "2.0.0"
+st.set_page_config(
+    page_title="EGX Daily Candle Downloader",
+    page_icon="📈",
+    layout="wide"
+)
 
-st.set_page_config(page_title="EGX Daily Candle Downloader", page_icon="📈", layout="wide")
-st.title("📈 EGX Daily Candle Downloader")
-st.caption(f"نسخة مستقلة لتنزيل شموع EGX اليومية OHLCV — الإصدار {APP_VERSION}")
+st.title("EGX FREE DAILY CANDLE DOWNLOADER")
+st.caption("برنامج مستقل لجلب الشموع اليومية بدون Apify أو API Key")
 
-DEFAULT_SYMBOLS = """COMI
+st.warning(
+    "Yahoo Finance مصدر غير رسمي، ومش مضمون إنه يدعم كل الأسهم المصرية. "
+    "البرنامج لا ينشئ شموع وهمية."
+)
+
+DEFAULT_SYMBOLS = """
+COMI
 MFPC
 PHDC
 ORAS
@@ -217,265 +223,372 @@ ATLC
 COSG
 AMPI
 COPR
-OCPH"""
+OCPH
+"""
 
 
-def read_secret(name: str) -> str:
-    try:
-        return str(st.secrets.get(name, "") or "").strip()
-    except Exception:
-        return ""
-
-
-def parse_symbols(raw: str) -> list[str]:
-    out = []
+def parse_symbols(raw):
+    result = []
     for line in raw.replace(",", "\n").replace(";", "\n").splitlines():
-        s = line.strip().upper().replace(".CA", "")
-        if s and s not in out:
-            out.append(s)
-    return out
+        symbol = line.strip().upper()
+        symbol = symbol.replace(".CA", "").replace(".EY", "")
+        if symbol and symbol not in result:
+            result.append(symbol)
+    return result
 
 
-def apify_request(method: str, path: str, token: str, **kwargs):
-    url = f"{APIFY_BASE}{path}"
-    params = kwargs.pop("params", {})
-    params["token"] = token
-    response = requests.request(method, url, params=params, timeout=(20, 90), **kwargs)
-    if not response.ok:
+def download_stock(symbol, start_date, end_date):
+    errors = []
+
+    # تجربة صيغ الرموز المختلفة
+    for ticker in [
+        symbol + ".CA",
+        symbol + ".EY",
+        symbol
+    ]:
         try:
-            detail = response.json()
-        except Exception:
-            detail = response.text[:500]
-        raise RuntimeError(f"Apify HTTP {response.status_code}: {str(detail)[:700]}")
-    return response
+            df = yf.download(
+                ticker,
+                start=start_date.isoformat(),
+                end=(end_date + timedelta(days=1)).isoformat(),
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+                timeout=25
+            )
+
+            if df is None or df.empty:
+                errors.append(ticker + ": لا توجد بيانات")
+                continue
+
+            if isinstance(df.columns, pd.MultiIndex):
+                try:
+                    df = df.xs(ticker, axis=1, level=-1)
+                except Exception:
+                    df.columns = [
+                        col[0] for col in df.columns
+                    ]
+
+            df.columns = [
+                str(col).lower().replace(" ", "_")
+                for col in df.columns
+            ]
+
+            required = [
+                "open", "high", "low", "close", "volume"
+            ]
+
+            if not all(col in df.columns for col in required):
+                errors.append(ticker + ": أعمدة OHLCV ناقصة")
+                continue
+
+            for col in required:
+                df[col] = pd.to_numeric(
+                    df[col], errors="coerce"
+                )
+
+            df = df.dropna(subset=required)
+
+            # التحقق من صحة الشمعة
+            df = df[
+                (df["high"] >= df[["open", "low", "close"]].max(axis=1))
+                &
+                (df["low"] <= df[["open", "high", "close"]].min(axis=1))
+            ]
+
+            if df.empty:
+                errors.append(ticker + ": لا توجد شموع سليمة")
+                continue
+
+            result = pd.DataFrame({
+                "symbol": symbol + ".CA",
+                "date": pd.to_datetime(df.index).date.astype(str),
+                "open": df["open"].values,
+                "high": df["high"].values,
+                "low": df["low"].values,
+                "close": df["close"].values,
+                "volume": df["volume"].values,
+                "currency": "EGP",
+                "source": "Yahoo Finance: " + ticker
+            })
+
+            return result, ticker
+
+        except Exception as error:
+            errors.append(ticker + ": " + str(error)[:120])
+
+        time.sleep(0.4)
+
+    raise RuntimeError(" | ".join(errors))
 
 
-def run_history_actor(token: str, tickers: list[str], start_day: date, end_day: date, max_results: int, status_box):
-    payload = {
-        "dataset": "history",
-        "tickers": tickers,
-        "historyFrom": start_day.isoformat(),
-        "historyTo": end_day.isoformat(),
-        "maxResults": int(max_results),
-    }
-    started = apify_request("POST", f"/acts/{APIFY_ACTOR}/runs", token,
-                            json=payload, params={"waitForFinish": 60}).json()
-    run_data = started.get("data", {})
-    run_id = run_data.get("id")
-    if not run_id:
-        raise RuntimeError(f"Apify did not return a run ID: {str(started)[:500]}")
+st.sidebar.header("إعدادات التحميل")
 
-    deadline = time.time() + 600
-    status = run_data.get("status", "RUNNING")
-    while status not in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
-        if time.time() > deadline:
-            raise TimeoutError(f"انتهت مهلة انتظار Apify. Run ID: {run_id} — راجع سجل التشغيل في حساب Apify.")
-        status_box.info(f"حالة تشغيل مصدر البيانات: {status} — رقم التشغيل: {run_id}")
-        time.sleep(4)
-        poll = apify_request("GET", f"/actor-runs/{run_id}", token).json()
-        run_data = poll.get("data", {})
-        status = run_data.get("status", "UNKNOWN")
+today = date.today()
 
-    if status != "SUCCEEDED":
-        msg = run_data.get("statusMessage") or run_data.get("status_message") or status
-        raise RuntimeError(f"فشل تشغيل Apify: {msg} (Run ID: {run_id})")
+start_date = st.sidebar.date_input(
+    "تاريخ البداية",
+    today - timedelta(days=365),
+    max_value=today
+)
 
-    dataset_id = run_data.get("defaultDatasetId")
-    if not dataset_id:
-        raise RuntimeError("التشغيل نجح لكن Apify لم يرجع defaultDatasetId")
-    items = apify_request("GET", f"/datasets/{dataset_id}/items", token,
-                          params={"format": "json", "clean": "true", "limit": 100000}).json()
-    if not isinstance(items, list):
-        raise RuntimeError(f"شكل بيانات Apify غير متوقع: {type(items).__name__}")
-    return items, run_id, run_data
+end_date = st.sidebar.date_input(
+    "تاريخ النهاية",
+    today,
+    min_value=start_date,
+    max_value=today
+)
 
+symbols_text = st.text_area(
+    "قائمة الأسهم",
+    DEFAULT_SYMBOLS,
+    height=350
+)
 
-def normalize_item(item: dict[str, Any]):
-    def pick(*keys):
-        for key in keys:
-            if item.get(key) is not None and item.get(key) != "":
-                return item.get(key)
-        return None
+manual_file = st.file_uploader(
+    "CSV يدوي لاستكمال الأسهم الناقصة (اختياري)",
+    type=["csv"]
+)
 
-    ticker = pick("ticker", "symbol", "Ticker", "Symbol", "stock_symbol")
-    day_value = pick("date", "trade_date", "trading_date", "Date", "timestamp")
-    if day_value is None:
-        return None
-    try:
-        day = pd.to_datetime(day_value, errors="coerce", utc=True)
-        if pd.isna(day):
-            day = pd.to_datetime(day_value, errors="coerce")
-        if pd.isna(day):
-            return None
-        day = day.date()
-    except Exception:
-        return None
+symbols = parse_symbols(symbols_text)
 
-    row = {
-        "symbol": str(ticker or "").upper().replace(".CA", ""),
-        "date": day.isoformat(),
-        "open": pick("open", "Open"),
-        "high": pick("high", "High"),
-        "low": pick("low", "Low"),
-        "close": pick("close", "Close", "price"),
-        "adj_close": pick("adj_close", "adjusted_close", "Adj Close"),
-        "volume": pick("volume", "Volume"),
-        "currency": pick("currency", "Currency") or "EGP",
-        "source": "Apify / Mansa Labs EGX Stock Data",
-    }
-    for col in ("open", "high", "low", "close", "adj_close", "volume"):
-        try:
-            row[col] = float(row[col]) if row[col] is not None else None
-        except (TypeError, ValueError):
-            row[col] = None
-    return row
+st.metric("عدد الأسهم المطلوبة", len(symbols))
 
+st.info(
+    "صيغة CSV اليدوي المطلوبة: "
+    "symbol,date,open,high,low,close,volume"
+)
 
-def validate_candle(row: dict):
-    missing = [k for k in ("open", "high", "low", "close", "volume") if row.get(k) is None]
-    if missing:
-        return False, "قيم ناقصة: " + ", ".join(missing)
-    o, h, l, c, v = (row[k] for k in ("open", "high", "low", "close", "volume"))
-    if min(o, h, l, c, v) < 0:
-        return False, "قيمة سالبة في OHLCV"
-    if h < max(o, l, c) or l > min(o, h, c):
-        return False, "ترتيب أسعار OHLC غير منطقي"
-    return True, "شمعة مكتملة وسليمة مبدئيًا"
+if st.button("بدء تحميل الشموع", type="primary", width="stretch"):
 
-
-with st.sidebar:
-    st.header("إعدادات التحميل")
-    saved_token = read_secret("APIFY_API_TOKEN") or read_secret("APIFY_TOKEN")
-    token_input = st.text_input("Apify API Token", value="", type="password",
-                                help="ضع APIFY_API_TOKEN في Streamlit Secrets أو أدخل التوكن هنا.")
-    apify_token = token_input.strip() or saved_token
-    if saved_token and not token_input.strip():
-        st.success("تم العثور على APIFY_API_TOKEN في Secrets")
-    st.divider()
-    today = date.today()
-    start_day = st.date_input("من تاريخ", value=today - timedelta(days=1), max_value=today)
-    end_day = st.date_input("إلى تاريخ", value=today, min_value=start_day, max_value=today)
-    max_results = st.number_input("أقصى عدد سجلات من المصدر", min_value=1, max_value=100000,
-                                  value=5000, step=100)
-    st.caption("التكلفة حسب صفحة المصدر: 15 دولار لكل 1,000 سجل + 0.005 دولار لكل تشغيل. راجع التسعير قبل التحميل الكبير.")
-
-st.subheader("قائمة الأسهم")
-col_a, col_b = st.columns([3, 1])
-with col_a:
-    symbols_raw = st.text_area("الرموز (تقدر تعدّل القائمة)", value=DEFAULT_SYMBOLS, height=220,
-                               help="القائمة المحفوظة من مشروعك السابق. كل رمز في سطر.")
-with col_b:
-    symbols = parse_symbols(symbols_raw)
-    st.metric("عدد الرموز", len(symbols))
-    st.metric("الفترة", f"{(end_day-start_day).days + 1} يوم")
-    st.caption("يتم إرسال الرموز في تشغيل واحد للمصدر.")
-
-st.info("المصدر: Apify Actor — EGX Stock Data من Mansa Labs. يدعم historyFrom وhistoryTo وبيانات OHLCV اليومية. يلزم Apify API Token.")
-st.warning("تنبيه: شمعة نفس اليوم قد لا تكون منشورة قبل انتهاء جلسة EGX وتحديث المصدر. البرنامج لا يستبدل شمعة اليوم بسعر لحظي ولا يختلق بيانات ناقصة.")
-
-if st.button("🚀 تنزيل الشموع اليومية", type="primary", use_container_width=True):
-    if not apify_token:
-        st.error("أضف APIFY_API_TOKEN في Streamlit Secrets أو أدخل التوكن في الشريط الجانبي.")
-        st.stop()
     if not symbols:
-        st.error("قائمة الأسهم فارغة.")
-        st.stop()
-    if start_day > end_day:
-        st.error("تاريخ البداية لازم يكون قبل تاريخ النهاية.")
+        st.error("قائمة الأسهم فارغة")
         st.stop()
 
-    status_box = st.empty()
-    try:
-        with st.spinner("جاري تشغيل مصدر بيانات EGX وانتظار الشموع..."):
-            raw_items, run_id, run_info = run_history_actor(apify_token, symbols, start_day, end_day,
-                                                             int(max_results), status_box)
-        status_box.success(f"انتهى المصدر بنجاح — Run ID: {run_id} — السجلات المستلمة: {len(raw_items)}")
+    progress = st.progress(0)
+    status = st.empty()
 
-        normalized = []
-        malformed = []
-        for item in raw_items:
-            if not isinstance(item, dict):
-                continue
-            row = normalize_item(item)
-            if row is None:
-                malformed.append({"raw": json.dumps(item, ensure_ascii=False)[:500], "reason": "تعذر قراءة التاريخ"})
-                continue
-            if not row["symbol"]:
-                malformed.append({"raw": json.dumps(item, ensure_ascii=False)[:500], "reason": "السجل لا يحتوي رمز سهم"})
-                continue
-            if start_day <= date.fromisoformat(row["date"]) <= end_day:
-                normalized.append(row)
+    frames = []
+    report = []
 
-        by_symbol = {}
-        for row in normalized:
-            by_symbol.setdefault(row["symbol"], []).append(row)
+    for index, symbol in enumerate(symbols, start=1):
 
-        good_rows, bad_rows = [], []
-        for ticker in symbols:
-            rows = by_symbol.get(ticker, [])
-            if not rows:
-                bad_rows.append({"symbol": ticker + ".CA", "date": "", "status": "لا توجد بيانات",
-                                 "message": "المصدر لم يرجع شموعًا لهذا السهم في الفترة المحددة"})
-                continue
-            for row in sorted(rows, key=lambda x: x["date"]):
-                valid, message = validate_candle(row)
-                if valid:
-                    good_rows.append({**row, "symbol": ticker + ".CA"})
-                else:
-                    bad_rows.append({"symbol": ticker + ".CA", "date": row["date"],
-                                     "status": "شمعة غير مكتملة/غير سليمة", "message": message})
+        status.write(
+            f"جاري تحميل {symbol} "
+            f"({index}/{len(symbols)})"
+        )
 
-        candles = pd.DataFrame(good_rows, columns=["symbol", "date", "open", "high", "low", "close",
-                                                   "adj_close", "volume", "currency", "source"])
-        report = pd.DataFrame(bad_rows, columns=["symbol", "date", "status", "message"])
-        returned_count = len(normalized)
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("شموع سليمة", len(candles))
-        c2.metric("أسهم في القائمة", len(symbols))
-        c3.metric("سجلات غير سليمة/ناقصة", len(bad_rows))
-        c4.metric("السجلات المستلمة", returned_count)
+        try:
+            frame, provider = download_stock(
+                symbol,
+                start_date,
+                end_date
+            )
 
-        st.subheader("الشموع المكتملة")
-        if candles.empty:
-            st.error("المصدر لم يرجع أي شمعة مكتملة ضمن الفترة. لن يتم إنشاء ملف شموع فارغ على أنه نجاح.")
-        else:
-            st.dataframe(candles, use_container_width=True, hide_index=True)
-            csv_candles = candles.to_csv(index=False).encode("utf-8-sig")
-            st.download_button("⬇️ تحميل الشموع CSV", csv_candles,
-                               file_name=f"EGX_daily_candles_{start_day}_{end_day}.csv",
-                               mime="text/csv", use_container_width=True)
+            frames.append(frame)
 
-        st.subheader("تقرير الأسهم والبيانات الناقصة")
-        if report.empty:
-            st.success("كل الأسهم اللي رجع لها المصدر بياناتها مكتملة مبدئيًا.")
-        else:
-            st.dataframe(report, use_container_width=True, hide_index=True)
+            report.append({
+                "symbol": symbol + ".CA",
+                "status": "نجاح",
+                "rows": len(frame),
+                "provider": provider,
+                "details": ""
+            })
 
-        report_csv = report.to_csv(index=False).encode("utf-8-sig")
-        raw_csv = pd.DataFrame(raw_items).to_csv(index=False).encode("utf-8-sig")
-        package = io.BytesIO()
-        with zipfile.ZipFile(package, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr(f"EGX_candles_{start_day}_{end_day}.csv", candles.to_csv(index=False).encode("utf-8-sig"))
-            zf.writestr(f"EGX_report_{start_day}_{end_day}.csv", report_csv)
-            zf.writestr("EGX_source_raw_response.csv", raw_csv)
-            zf.writestr("run_info.json", json.dumps({"run_id": run_id, "status": run_info.get("status"),
-                                                       "requested_tickers": len(symbols),
-                                                       "returned_raw_items": len(raw_items),
-                                                       "valid_candles": len(candles),
-                                                       "from": start_day.isoformat(), "to": end_day.isoformat()},
-                                                      ensure_ascii=False, indent=2))
-        st.download_button("📦 تحميل الحزمة الكاملة ZIP", package.getvalue(),
-                           file_name=f"EGX_Candle_Package_{start_day}_{end_day}.zip",
-                           mime="application/zip", use_container_width=True)
-        if malformed:
-            with st.expander("سجلات لم يستطع البرنامج قراءتها"):
-                st.dataframe(pd.DataFrame(malformed), use_container_width=True, hide_index=True)
-    except requests.Timeout:
-        st.error("انتهت مهلة الاتصال بمصدر البيانات. جرّب مرة أخرى أو قلّل عدد الأسهم/الفترة.")
-    except Exception as exc:
-        st.error(f"فشل التحميل: {exc}")
+        except Exception as error:
 
-st.divider()
-st.markdown("**إعداد Streamlit Secrets**")
-st.code('APIFY_API_TOKEN = "ضع_توكن_Apify_هنا"', language="toml")
-st.caption("لا تضع التوكن داخل GitHub أو داخل الكود. لم يتم اختبار تشغيل Actor فعليًا لعدم توفر توكن حسابك؛ تم تجهيز الاتصال وفق واجهة Apify المعلنة.")
+            report.append({
+                "symbol": symbol + ".CA",
+                "status": "فشل",
+                "rows": 0,
+                "provider": "",
+                "details": str(error)
+            })
+
+        progress.progress(index / len(symbols))
+        time.sleep(0.5)
+
+    data = (
+        pd.concat(frames, ignore_index=True)
+        if frames else pd.DataFrame()
+    )
+
+    # استكمال البيانات من CSV يدوي
+    if manual_file is not None:
+
+        try:
+            manual = pd.read_csv(manual_file)
+
+            manual.columns = [
+                str(col).strip().lower().replace(" ", "_")
+                for col in manual.columns
+            ]
+
+            required = [
+                "symbol", "date", "open",
+                "high", "low", "close", "volume"
+            ]
+
+            if not all(col in manual.columns for col in required):
+                raise ValueError(
+                    "تأكد من وجود الأعمدة: "
+                    + ", ".join(required)
+                )
+
+            manual["symbol"] = (
+                manual["symbol"].astype(str).str.upper()
+                .str.replace(".EY", "", regex=False)
+                .str.replace(".CA", "", regex=False)
+                + ".CA"
+            )
+
+            manual["date"] = pd.to_datetime(
+                manual["date"], errors="coerce"
+            )
+
+            manual = manual.dropna(subset=["date"])
+
+            manual = manual[
+                (manual["date"].dt.date >= start_date)
+                & (manual["date"].dt.date <= end_date)
+            ]
+
+            for col in [
+                "open", "high", "low", "close", "volume"
+            ]:
+                manual[col] = pd.to_numeric(
+                    manual[col], errors="coerce"
+                )
+
+            manual = manual.dropna(
+                subset=[
+                    "open", "high", "low", "close", "volume"
+                ]
+            )
+
+            manual["date"] = manual["date"].dt.date.astype(str)
+            manual["currency"] = "EGP"
+            manual["source"] = "Manual CSV"
+
+            if "adj_close" not in manual.columns:
+                manual["adj_close"] = manual["close"]
+
+            if data.empty:
+                data = manual
+            else:
+                data = pd.concat(
+                    [data, manual],
+                    ignore_index=True
+                )
+
+        except Exception as error:
+            st.error("خطأ في CSV اليدوي: " + str(error))
+
+    if not data.empty:
+
+        # البيانات اليدوية لها الأولوية عند تكرار الرمز والتاريخ
+        data = data.drop_duplicates(
+            subset=["symbol", "date"],
+            keep="last"
+        )
+
+        data = data.sort_values(
+            ["symbol", "date"]
+        )
+
+    report_df = pd.DataFrame(report)
+
+    st.subheader("ملخص التحميل")
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric(
+        "عدد الشموع",
+        len(data)
+    )
+
+    col2.metric(
+        "أسهم لها بيانات",
+        data["symbol"].nunique() if not data.empty else 0
+    )
+
+    col3.metric(
+        "عدد الأسهم المطلوبة",
+        len(symbols)
+    )
+
+    st.subheader("تقرير الأسهم")
+
+    st.dataframe(
+        report_df,
+        width="stretch",
+        hide_index=True
+    )
+
+    st.subheader("بيانات الشموع")
+
+    if data.empty:
+
+        st.error(
+            "لم يتم العثور على بيانات صالحة. "
+            "لم يتم إنشاء بيانات بديلة."
+        )
+
+    else:
+
+        st.dataframe(
+            data,
+            width="stretch",
+            hide_index=True
+        )
+
+        csv_bytes = data.to_csv(
+            index=False
+        ).encode("utf-8-sig")
+
+        st.download_button(
+            "تحميل ملف CSV",
+            csv_bytes,
+            "EGX_daily_candles.csv",
+            "text/csv",
+            width="stretch"
+        )
+
+    # إنشاء ZIP
+    memory = io.BytesIO()
+
+    with zipfile.ZipFile(
+        memory, "w", zipfile.ZIP_DEFLATED
+    ) as archive:
+
+        archive.writestr(
+            "EGX_daily_candles.csv",
+            data.to_csv(index=False).encode("utf-8-sig")
+            if not data.empty else ""
+        )
+
+        archive.writestr(
+            "EGX_download_report.csv",
+            report_df.to_csv(index=False).encode("utf-8-sig")
+        )
+
+        archive.writestr(
+            "README.txt",
+            "Independent EGX Daily Candle Downloader. "
+            "Yahoo Finance is unofficial and coverage is not guaranteed. "
+            "No synthetic candles are generated."
+        )
+
+    st.download_button(
+        "تحميل ملف ZIP الكامل",
+        memory.getvalue(),
+        "EGX_Daily_Candles.zip",
+        "application/zip",
+        width="stretch"
+    )
+
+st.caption(
+    "ملاحظة: Yahoo Finance قد لا يدعم كل الأسهم المصرية. "
+    "لا تعتبر عدم ظهور البيانات دليلاً على عدم وجود تداول."
+)
